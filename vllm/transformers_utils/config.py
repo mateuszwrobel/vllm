@@ -627,9 +627,7 @@ def get_config(
     _is_remote_gguf = is_remote_gguf(model)
     if _is_gguf:
         if check_gguf_file(model):
-            # Local GGUF file
-            kwargs["gguf_file"] = Path(model).name
-            model = Path(model).parent
+            return model, tokenizer, vllm_speculative_config
         elif _is_remote_gguf:
             # Remote GGUF - extract repo_id from repo_id:quant_type format
             # The actual GGUF file will be downloaded later by GGUFModelLoader
