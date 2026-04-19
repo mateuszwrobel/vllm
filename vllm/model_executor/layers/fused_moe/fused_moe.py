@@ -1923,17 +1923,17 @@ class TritonExperts(mk.FusedMoEExpertsModular):
     ) -> bool:
         p = current_platform
         if p.is_rocm():
-            from vllm.platforms.rocm import on_gfx9, on_gfx12x
+            from vllm.platforms.rocm import on_gfx1x, on_gfx9
 
             is_rocm_on_gfx9 = on_gfx9()
-            is_rocm_on_gfx12x = on_gfx12x()
+            is_rocm_on_gfx1x = on_gfx1x()
         else:
             is_rocm_on_gfx9 = False
-            is_rocm_on_gfx12x = False
+            is_rocm_on_gfx1x = False
 
         device_supports_fp8 = (
             is_rocm_on_gfx9
-            or is_rocm_on_gfx12x
+            or is_rocm_on_gfx1x
             or (p.is_cuda() and p.has_device_capability((8, 9)))
             or p.is_xpu()
         )
