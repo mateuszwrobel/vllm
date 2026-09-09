@@ -1,0 +1,5 @@
+# these .hip sources are vendored inputs to the image build, not generated
+!radiance_mxfp4_fp8.hip
+!radiance_autoround.hip
+!radiance_escha.hip
+!radiance_paroquant.hip
