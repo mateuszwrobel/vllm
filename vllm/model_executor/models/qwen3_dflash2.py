@@ -8,6 +8,7 @@ from torch import nn
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -18,6 +19,9 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+
+logger = init_logger(__name__)
 
 
 def _grouped_conv(
@@ -123,6 +127,19 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
+        # radiance: the block size comes from the serve, not the checkpoint, and nothing upstream
+        # checks the two against each other -- a block-diffusion drafter denoises a fixed number of
+        # mask positions and was trained for one block length, and serving another length is a
+        # silent acceptance loss, not an error.
+        _trained = int(draft_config.get("block_size", 0))
+        _asked = 1 + speculative_config.num_speculative_tokens
+        if layer_idx == 0 and _trained and _asked != _trained:
+            logger.warning(
+                "DFlash2 checkpoint was trained with block_size=%d "
+                "(num_speculative_tokens=%d); this serve asks for %d. The drafter will run, and "
+                "acceptance will be below what the checkpoint can do.",
+                _trained, _trained - 1, _asked,
+            )
         conv_args = dict(
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
