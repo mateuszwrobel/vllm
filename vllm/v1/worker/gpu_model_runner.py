@@ -5317,6 +5317,7 @@ class GPUModelRunner(
                 hidden_states = alt
 
             num_rejected_tokens_gpu = None
+            token_indices = None
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
@@ -5369,10 +5370,23 @@ class GPUModelRunner(
                         target_hidden_states = hidden_states[:total_num_tokens]
 
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
-                mm_embed_inputs = self._gather_mm_embeddings(
+                mm_embeds, is_mm_embed = self._gather_mm_embeddings(
                     scheduler_output,
                     shift_computed_tokens=1,
                 )
+                # radiance: align the placeholder mask with the drafter's
+                # compacted token layout. disable_padded_drafter_batch drops
+                # rejected tokens via token_indices while the mask is built at
+                # scheduled scale; without this the mask outlives the draft
+                # inputs_embeds buffer -> IndexError. Placeholders are prompt
+                # tokens (never rejected), so the gather preserves them 1:1.
+                if (
+                    is_mm_embed is not None
+                    and token_indices is not None
+                    and is_mm_embed.shape[0] != target_token_ids.shape[0]
+                ):
+                    is_mm_embed = is_mm_embed[token_indices.to(is_mm_embed.device)]
+                mm_embed_inputs = (mm_embeds, is_mm_embed)
             else:
                 mm_embed_inputs = None
 

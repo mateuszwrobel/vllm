@@ -130,7 +130,8 @@ def _sync_hip_cuda_env_vars():
     hip_val = os.environ.get("HIP_VISIBLE_DEVICES") or None
     cuda_val = os.environ.get("CUDA_VISIBLE_DEVICES") or None
 
-    if cuda_val is not None:
+    # radiance: only warn when HIP_VISIBLE_DEVICES is not also set.
+    if cuda_val is not None and hip_val is None:
         logger.warning_once(
             "Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support "
             "will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES "
@@ -201,6 +202,13 @@ def _get_gcn_arch() -> str:
     Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
     Called once at module level; result stored in _GCN_ARCH.
     """
+    # radiance: honor RADIANCE_GFX_ARCH env. amdsmi's asic_info
+    # target_graphics_version is empty for gfx1201 so the query raises, and
+    # the torch.cuda fallback then crashes at import. VLLM_ROCM_GCN_ARCH is
+    # the pre-0.5.1 name for the same knob, still accepted.
+    env = os.environ.get("RADIANCE_GFX_ARCH") or os.environ.get("VLLM_ROCM_GCN_ARCH")
+    if env:
+        return env
     try:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:

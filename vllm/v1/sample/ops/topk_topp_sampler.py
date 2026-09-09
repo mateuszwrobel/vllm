@@ -118,6 +118,9 @@ class TopKTopPSampler(nn.Module):
             logprobs_mode not in PROCESSED_LOGPROBS_MODES
             and rocm_aiter_ops.is_enabled()
             and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable
+            # radiance: gfx1201 -- AITER's sampler C++/HIP kernel fails to
+            # build on RDNA4. Gate to MI3xx; gfx12x uses the native sampler.
+            and __import__("vllm.platforms.rocm", fromlist=["on_mi3xx"]).on_mi3xx()
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
@@ -346,6 +349,17 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
+# radiance: row count at or above which apply_top_k_top_p uses the Triton
+# kernel rather than a vocab-wide sort. Upstream hardcodes 8, but the sort is
+# slower than Triton at every row count on gfx1201 (measured 235-1900 us vs a
+# flat ~210 us to 20 rows at vocab 248320); speculative decode lands right
+# under the gate (batch x SPEC+1 = 5 rows). Paths are bit-identical. Set to 8
+# to restore upstream behaviour.
+_RADIANCE_TRITON_MIN_ROWS = int(
+    __import__("os").environ.get("RADIANCE_TOPK_TRITON_MIN_ROWS") or 1
+)
+
+
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
@@ -357,7 +371,7 @@ def apply_top_k_top_p(
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
+    if HAS_TRITON and logits.shape[0] >= _RADIANCE_TRITON_MIN_ROWS:
         return apply_top_k_top_p_triton(logits, k, p)
 
     # Use pytorch sort implementation for small batch sizes.

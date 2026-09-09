@@ -67,6 +67,14 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+# radiance: optional R4D (hand-written gfx1201) gated-delta-net kernels. With
+# the library missing or RADIANCE_USE_R4D=0 every hook installed below
+# declines and the Triton bodies run untouched.
+try:
+    from vllm.radiance import radiance_gdn as _radiance_gdn
+except Exception:
+    _radiance_gdn = None
+
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
 # references are imported here so that they can be called without per-call
@@ -1262,6 +1270,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata_raw is None:
             self._warmup_prefill_kernels(mixed_qkv, 0)
             return
+
+        # radiance: all-R4D gated delta net. conv_prep -> kkt_solve ->
+        # chunk_scan for a prefill step, conv_update -> recurrent_update for a
+        # speculative decode step. Returns False for any step it does not
+        # cover, which leaves the Triton body below exactly as it was.
+        if _radiance_gdn is not None and _radiance_gdn.ALL:
+            if _radiance_gdn.forward_core_fused(self, mixed_qkv, b, a, core_attn_out):
+                return
 
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]

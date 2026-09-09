@@ -113,11 +113,32 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+try:
+    from vllm.radiance import radiance_gemm as _radiance_gemm
+except Exception:
+    _radiance_gemm = None
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
     from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
 
+    # radiance: skinny bf16 GEMMs small enough that rocBLAS underfills the
+    # machine go to the R4D split-K kernel. radiance_gemm holds the measured
+    # (N, K) table and declines everything else; gated by RADIANCE_USE_R4D
+    # inside the module.
+    if (
+        _radiance_gemm is not None
+        and _radiance_gemm.ENABLED
+        and bias is None
+        and weight.dim() == 2
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        _out = _radiance_gemm.maybe_gemm(x, weight)
+        if _out is not None:
+            return _out
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]

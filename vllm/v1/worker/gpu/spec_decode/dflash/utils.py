@@ -45,9 +45,22 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         ),
     )
     with set_model_tag("dflash_head"):
-        dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
-        )
+        # radiance: bracket the drafter load so radiance_w4 (4-bit packer in
+        # process_weights_after_loading) can tell a drafter linear from a
+        # target one. try/finally: a failed load must not leave the flag set.
+        try:
+            from vllm.radiance import radiance_w4 as _radiance_w4
+        except Exception:
+            _radiance_w4 = None
+        if _radiance_w4 is not None:
+            _radiance_w4.begin_draft()
+        try:
+            dflash_model = get_model(
+                vllm_config=draft_vllm_config, model_config=draft_model_config
+            )
+        finally:
+            if _radiance_w4 is not None:
+                _radiance_w4.end_draft()
 
     target_language_model = (
         target_model.get_language_model()

@@ -50,6 +50,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.triton_attn_diffkv.TritonAttentionDiffKVBackend"
     )
     ROCM_ATTN = "vllm.v1.attention.backends.rocm_attn.RocmAttentionBackend"
+    # radiance: hand-written gfx1201 attention backend, selected explicitly
+    # via --attention-backend R4D; never added to the platform auto-selection
+    # list. Resolves through vllm.radiance.radiance_r4d_attn.
+    R4D = "vllm.radiance.radiance_r4d_attn.R4DAttentionBackend"
     ROCM_AITER_MLA = "vllm.v1.attention.backends.mla.rocm_aiter_mla.AiterMLABackend"
     ROCM_AITER_TRITON_MLA = (
         "vllm.v1.attention.backends.mla.aiter_triton_mla.AiterTritonMLABackend"

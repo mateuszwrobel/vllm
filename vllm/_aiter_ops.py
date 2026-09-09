@@ -148,9 +148,10 @@ def is_aiter_found_and_supported() -> bool:
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import get_cdna_version
+        from vllm.platforms.rocm import get_cdna_version, on_gfx12x
 
-        return get_cdna_version() > 2
+        # radiance: treat gfx12x as AITER-capable too (upstream gates on CDNA).
+        return get_cdna_version() > 2 or on_gfx12x()
     return False
 
 

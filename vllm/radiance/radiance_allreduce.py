@@ -32,9 +32,15 @@ _DTYPE_CODE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
 # chunk's all-reduce (4096 tokens x 5120 channels x bf16 = 40 MiB), so a serve running the shipped
 # --max-num-batched-tokens keeps the kernel for prefill as well as decode. Costs 2x this in IPC
 # scratch per rank, which is trivial on 32 GB. The kernel is bit-identical to RCCL at every size.
-_MAX_BYTES = 49152 * 1024
+#
+# radiance: this has to track --max-num-batched-tokens. The gate compares the raw bf16 byte count,
+# so the message is tokens x hidden x 2: at chunk 8192 and hidden 5120 it is 80 MiB, over the
+# default, and every prefill reduction silently falls back to RCCL. Measured cost of that fallback
+# here: all-reduce 18.8% of prefill GPU time at 3.145 ms per call vs 1.317 ms on the kernel
+# (2.18x). The default below is upstream's, so an unconfigured serve is unchanged.
+_MAX_BYTES = int(os.environ.get("RADIANCE_AR_MAX_KB") or 49152) * 1024
 # Below this the exact bf16 kernel wins: compression only pays once the transfer is bandwidth-bound.
-_QUANT_MIN_BYTES = 128 * 1024
+_QUANT_MIN_BYTES = int(os.environ.get("RADIANCE_AR_QUANT_MIN_KB") or 128) * 1024
 
 
 def _log(msg):

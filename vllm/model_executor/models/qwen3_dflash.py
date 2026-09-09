@@ -375,6 +375,31 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+_DFLASH_DENSE = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _dflash_kv_weight_rows(qkv_proj, q_size: int) -> torch.Tensor:
+    """The K/V rows of a qkv projection as a dense compute-dtype matrix.
+
+    radiance: a quantized qkv_proj cannot be sliced directly (fp8 raises
+    against bf16 activations, packed MXFP4 is not a float matrix at all), so
+    the rows are recovered by pushing an identity through the layer, which
+    runs whatever quant method is installed. Identity entries are exactly
+    representable in e2m1 / e4m3, so the result is the dequantized weight.
+    """
+    weight = qkv_proj.weight
+    if weight.dtype in _DFLASH_DENSE:
+        return weight[q_size:]
+    dtype = getattr(qkv_proj, "orig_dtype", torch.bfloat16)
+    eye = torch.eye(
+        qkv_proj.input_size_per_partition, dtype=dtype, device=weight.device
+    )
+    out = qkv_proj(eye)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out[:, q_size:].t().contiguous()
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -487,8 +512,16 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+        # radiance: defer for a quantized weight -- the dense rows cannot be
+        # read until the quant method has processed the weights (after
+        # load_weights returns); the build lands on first use (profile run),
+        # still before any CUDA graph capture.
+        self._kv_source_attn = layers_attn
+        if layers_attn[0].qkv_proj.weight.dtype not in _DFLASH_DENSE:
+            self._fused_kv_weight = None
+        else:
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
@@ -560,6 +593,16 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
+        # radiance: materialize the fused KV weight on first use for the
+        # quantized-drafter case (see _build_context_kv_buffers).
+        if self._fused_kv_weight is None:
+            self._fused_kv_weight = torch.cat(
+                [
+                    _dflash_kv_weight_rows(a.qkv_proj, a.q_size)
+                    for a in self._kv_source_attn
+                ],
+                dim=0,
+            )
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )

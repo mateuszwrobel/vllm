@@ -508,6 +508,12 @@ class DelegatingParser(Parser):
                     or (isinstance(content, str) and not content.strip())
                 ):
                     return [], None
+                # Engine-based parsers already strip incomplete / un-promoted
+                # tool-call markup from content, so return that (drops it)
+                # rather than the raw input. Keeps non-streaming in agreement
+                # with streaming on a truncated <tool_call> opener (vLLM #47137).
+                if self._engine_based and tool_call_info is not None:
+                    return None, tool_call_info.content
                 return None, content
 
         return tool_calls, content

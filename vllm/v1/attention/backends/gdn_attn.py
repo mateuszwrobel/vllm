@@ -79,6 +79,35 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+_RADIANCE_GDN_META = __import__("os").environ.get("RADIANCE_GDN_META", "1") == "1"
+
+
+def _radiance_arange(builder, n: int, device) -> torch.Tensor:
+    """arange(n) as a slice of one cached buffer -- read-only downstream.
+
+    radiance: never populate the cache during a graph capture (an allocation
+    there comes from the graph's private pool); capture falls back to the
+    stock allocation and the first ordinary build fills the cache.
+    """
+    c = getattr(builder, "_radiance_arange_buf", None)
+    if c is None or c.numel() < n or c.device != device:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.arange(n, dtype=torch.int32, device=device)
+        c = torch.arange(max(n, 4096), dtype=torch.int32, device=device)
+        builder._radiance_arange_buf = c
+    return c[:n]
+
+
+def _radiance_empty_idx(builder, device) -> torch.Tensor:
+    c = getattr(builder, "_radiance_empty_buf", None)
+    if c is None or c.device != device:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.empty(0, dtype=torch.int32, device=device)
+        c = torch.empty(0, dtype=torch.int32, device=device)
+        builder._radiance_empty_buf = c
+    return c
+
+
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -228,19 +257,32 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        # radiance: one numpy pass over the same buffer instead of mask /
+        # index / sum / item and then the mask a second time.
+        _r_np = _RADIANCE_GDN_META and num_decode_draft_tokens_cpu is not None
+        _ndt_np = num_decode_draft_tokens_cpu.numpy() if _r_np else None
+        _mask_np = None if _ndt_np is None else _ndt_np >= 0
         if (
             not self.use_spec_decode
             or num_decode_draft_tokens_cpu is None
-            or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
-            .sum()
-            .item()
-            == 0
+            or (
+                int(_ndt_np[_mask_np].sum()) == 0
+                if _r_np
+                else num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
+                .sum()
+                .item()
+                == 0
+            )
         ):
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+            if _r_np:
+                spec_sequence_masks_cpu = torch.from_numpy(_mask_np)
+                num_spec_decodes = int(_mask_np.sum())
+            else:
+                spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+                num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
@@ -268,18 +310,34 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
             # Use CPU tensors to avoid CPU-GPU sync
-            non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-            # Exclude zero-length padded sequences from prefill count.
-            num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
-            num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
-            num_decode_tokens = num_decodes
-            num_prefill_tokens = (
-                non_spec_query_lens_cpu.sum().item() - num_decode_tokens
-            )
-            num_spec_decode_tokens = (
-                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
-            )
+            if _r_np:
+                # radiance: same integers, one numpy pass. `size` is the numpy
+                # spelling of `size(0)` for these 1-D per-request vectors.
+                _qlen_np = query_lens_cpu.numpy()
+                _nonspec_np = _qlen_np[~_mask_np]
+                num_decodes = int((_nonspec_np == 1).sum())
+                num_zero_len = int((_nonspec_np == 0).sum())
+                num_prefills = _nonspec_np.size - num_decodes - num_zero_len
+                num_decode_tokens = num_decodes
+                num_prefill_tokens = int(_nonspec_np.sum()) - num_decode_tokens
+                num_spec_decode_tokens = (
+                    int(_qlen_np.sum()) - num_prefill_tokens - num_decode_tokens
+                )
+            else:
+                non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
+                num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+                # Exclude zero-length padded sequences from prefill count.
+                num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
+                num_prefills = (
+                    non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
+                )
+                num_decode_tokens = num_decodes
+                num_prefill_tokens = (
+                    non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+                )
+                num_spec_decode_tokens = (
+                    query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+                )
 
             # num_decodes and num_spec_decodes are mutually exclusive.
             # Reclassify non-spec decodes as prefills when spec decodes
@@ -296,18 +354,46 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     num_spec_decodes * (self.num_spec + 1),
                     query_start_loc_cpu[-1].item(),
                 )
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
+                if _RADIANCE_GDN_META:
+                    # radiance: both of these depend only on their length and
+                    # are read once, by the copy_ into the persistent buffers
+                    # below.
+                    spec_token_indx = _radiance_arange(
+                        self, spec_token_size, query_start_loc.device
+                    )
+                    non_spec_token_indx = _radiance_empty_idx(
+                        self, query_start_loc.device
+                    )
+                else:
+                    spec_token_indx = torch.arange(
+                        spec_token_size,
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
+                    non_spec_token_indx = torch.empty(
+                        0, dtype=torch.int32, device=query_start_loc.device
+                    )
                 # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
+                # radiance: when every sequence is a spec decode the mask
+                # selects every row, so a slice carries the same values without
+                # the gather. Only taken when the cudagraph branch below will
+                # consume it, since that consumer is a copy_ and a strided
+                # source is fine there.
+                if (
+                    _RADIANCE_GDN_META
+                    and _r_np
+                    and self.use_full_cuda_graph
+                    and num_spec_decodes <= self.decode_cudagraph_max_bs
+                    and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+                    and bool(_mask_np.all())
+                ):
+                    spec_state_indices_tensor = block_table_tensor[
+                        : _mask_np.size, : self.num_spec + 1
+                    ]
+                else:
+                    spec_state_indices_tensor = block_table_tensor[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
