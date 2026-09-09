@@ -283,7 +283,17 @@ class Sampler:
         if use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
+            # radiance: CPU-known bound, no sync.
+            _rad_kmax = (
+                0 if top_k is None
+                else int(self.sampling_states.top_k.np[idx_mapping_np].max())
+            )
+            processed_logits = apply_top_k_top_p(
+                processed_logits, top_k, top_p,
+                max_top_k=(
+                    0 if _rad_kmax >= self.sampling_states.vocab_size else _rad_kmax
+                ),
+            )
             sampled = gumbel_sample(
                 processed_logits,
                 expanded_idx_mapping,

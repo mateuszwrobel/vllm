@@ -360,6 +360,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
             )
+            # radiance: merge each GDN layer's two input projections into one GEMM.
+            from vllm.radiance import radiance_gdnmerge as _radiance_gdnmerge
+
+            _radiance_gdnmerge.merge_model(self.model)
             if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
@@ -1337,6 +1341,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        # radiance: evaluate the subsystem gate on the sampling params before
+        # compute_logits -- the processor itself sees neither the params nor
+        # the batch; `sample()` sees both, one line above.
+        try:
+            from vllm.radiance import radiance_verifyhead as _radiance_vh
+            _radiance_vh.before_compute_logits(self, input_batch, grammar_output)
+        except Exception:
+            pass
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.

@@ -5449,6 +5449,10 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                # radiance: merge each GDN layer's two input projections into one GEMM.
+                from vllm.radiance import radiance_gdnmerge as _radiance_gdnmerge
+
+                _radiance_gdnmerge.merge_model(self.model)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device

@@ -179,6 +179,17 @@ class AiterFusedAddRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
         )
 
 
+# --- RADIANCE: native rms+quant replacement op ---
+import os as _rq_os
+if _rq_os.environ.get("RADIANCE_RMS_QUANT_FUSION", "0") == "1":
+    from vllm.radiance import radiance_rmsquant as _rq
+    AiterRMSNormDynamicQuantPattern.FUSED_OP = staticmethod(_rq.fused_rmsnorm_quant)
+    AiterFusedAddRMSNormDynamicQuantPattern.FUSED_OP = staticmethod(_rq.fused_add_rmsnorm_quant)
+    import sys as _rq_sys
+    _rq_sys.stderr.write("[radiance.rmsquant] rms+quant fusion -> radiance op "
+                         "(aiter replacement bypassed)\n")
+
+
 class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
     This pattern fuses aiter rms_norm & group fp8 quant custom

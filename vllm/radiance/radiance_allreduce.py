@@ -126,8 +126,12 @@ class RadianceAllreduce:
         # (RCCL-identical) bf16 path.
         self.ar_quant = os.environ.get("RADIANCE_USE_R4D_AR_QUANT", "1") == "1"
         self.quant_min_bytes = _QUANT_MIN_BYTES
-        self.qnt = 1024        # threads/block for the compressed push (wire-bound; not sensitive)
-        self.qmax_nb = 48      # block cap for the compressed path
+        # Threads/block and block cap for the compressed path. The shipped 1024/48
+        # assumed the kernel is wire-bound; its LOCAL traffic (~280 MB/call at
+        # the 80 MiB message) says the DRAM phases matter too, so both are
+        # sweepable.
+        self.qnt = int(os.environ.get("RADIANCE_AR_QNT", "1024"))
+        self.qmax_nb = int(os.environ.get("RADIANCE_AR_QNB", "48"))
         self._qext = None
         self._qgroup = 0
         self._locpk = None

@@ -236,6 +236,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             ),
         )
 
+    # radiance (patch_gdn_shared_build.py): the runner passes a per-step dict here.
+    _radiance_shared_build = True
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -243,8 +246,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        _radiance_shared: dict | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+
+        # radiance (patch_gdn_shared_build.py): a previous GDN group already built this
+        # step's metadata. Only the block-table-derived indices are per-group; everything
+        # else is copied buffer-to-buffer from the first group's already-padded buffers
+        # into THIS builder's buffers (each group's cudagraph captured its own addresses).
+        if _radiance_shared and _radiance_shared.get("kind") == "spec_fast":
+            sh = _radiance_shared
+            import dataclasses as _dc
+            bt = mamba_get_block_table_tensor(
+                m.block_table_tensor, m.seq_lens, self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
+            nsd = sh["nsd"]
+            bs = m.num_reqs
+            if sh["mask_all"]:
+                sidx = bt[: sh["mask_rows"], : self.num_spec + 1]
+            else:
+                sidx = bt[sh["mask_cpu"], : self.num_spec + 1]
+            self.spec_state_indices_tensor[:nsd].copy_(sidx, non_blocking=True)
+            sst = self.spec_state_indices_tensor[:bs]
+            sst[nsd:].fill_(NULL_BLOCK_ID)
+            self.spec_sequence_masks[:bs].copy_(sh["masks_src"], non_blocking=True)
+            self.spec_token_indx[: sh["si_n"]].copy_(sh["si_src"], non_blocking=True)
+            self.non_spec_token_indx[: sh["nsi_n"]].copy_(
+                sh["nsi_src"], non_blocking=True)
+            self.spec_query_start_loc[: bs + 1].copy_(sh["qsl_src"], non_blocking=True)
+            self.num_accepted_tokens[:bs].copy_(sh["acc_src"], non_blocking=True)
+            return _dc.replace(
+                sh["md"],
+                spec_state_indices_tensor=sst,
+                spec_sequence_masks=self.spec_sequence_masks[:bs],
+                spec_token_indx=self.spec_token_indx[: sh["si_n"]],
+                non_spec_token_indx=self.non_spec_token_indx[: sh["nsi_n"]],
+                spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
+                num_accepted_tokens=self.num_accepted_tokens[:bs],
+            )
+        _rad_fastpath = False
+        _rad_mask_all = False
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -390,6 +432,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_state_indices_tensor = block_table_tensor[
                         : _mask_np.size, : self.num_spec + 1
                     ]
+                    _rad_mask_all = True
                 else:
                     spec_state_indices_tensor = block_table_tensor[
                         spec_sequence_masks_cpu, : self.num_spec + 1
@@ -559,6 +602,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
+            _rad_fastpath = True
 
         if (
             self.use_full_cuda_graph
@@ -607,6 +651,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        # radiance (patch_gdn_shared_build.py): make this build reusable by the step's
+        # remaining GDN groups. Only the steady spec-decode cudagraph shape qualifies.
+        if (
+            _radiance_shared is not None
+            and not _radiance_shared
+            and _rad_fastpath
+            and num_prefills == 0
+            and num_decodes == 0
+        ):
+            _radiance_shared.update(
+                kind="spec_fast", md=attn_metadata, nsd=num_spec_decodes,
+                mask_all=_rad_mask_all,
+                mask_rows=(spec_sequence_masks_cpu.numel()
+                           if spec_sequence_masks_cpu is not None else 0),
+                mask_cpu=spec_sequence_masks_cpu,
+                masks_src=spec_sequence_masks,
+                si_src=spec_token_indx, si_n=spec_token_indx.size(0),
+                nsi_src=non_spec_token_indx, nsi_n=non_spec_token_indx.size(0),
+                qsl_src=spec_query_start_loc, acc_src=num_accepted_tokens,
+            )
         return attn_metadata
 
     def build_for_cudagraph_capture(

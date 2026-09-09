@@ -187,3 +187,32 @@ __all__ = [
     "register_quantization_config",
     "QUANTIZATION_METHODS",
 ]
+
+# radiance: register the gfx1201 AutoRound int4 W4A8 config. Must happen before ModelConfig
+# resolves the checkpoint's quant_method, otherwise vLLM's INC config claims "auto-round" and the
+# engine dies with "inc quantization is currently not supported in rocm". Import failures are
+# reported and swallowed: a broken side module must not take down every other quantization method.
+import os as _radiance_os  # noqa: E402
+
+if _radiance_os.environ.get("RADIANCE_AUTOROUND", "0") == "1":
+    try:
+        from vllm.radiance import radiance_autoround  # noqa: F401,E402
+    except Exception as _radiance_exc:  # pragma: no cover
+        import sys as _radiance_sys  # noqa: E402
+        _radiance_sys.stderr.write(
+            f"[radiance.autoround] registration FAILED: {_radiance_exc!r}\n")
+
+# radiance: register the gfx1201 escha (EXL3 trellis) W2 config. Must happen before ModelConfig
+# resolves the checkpoint's quant_method; "escha" is unknown to vLLM, so without this the engine
+# exits during argument parsing. Import failures are reported and swallowed: a broken side module
+# must not take down every other quantization method.
+import os as _radiance_escha_os  # noqa: E402
+
+if _radiance_escha_os.environ.get("RADIANCE_ESCHA", "0") == "1":
+    try:
+        from vllm.radiance import radiance_escha as _radiance_escha_mod  # noqa: E402
+        _radiance_escha_mod.register()
+    except Exception as _radiance_escha_exc:  # pragma: no cover
+        import sys as _radiance_escha_sys  # noqa: E402
+        _radiance_escha_sys.stderr.write(
+            f"[radiance.escha] registration FAILED: {_radiance_escha_exc!r}\n")
